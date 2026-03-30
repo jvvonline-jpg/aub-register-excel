@@ -52,9 +52,17 @@ def extract_amounts_from_text(text):
 
 
 def is_date_line(line):
-    """Check if line is a date like 'FEB 17' or a year like '2026'."""
-    return bool(re.match(rf'^{MONTH_PAT}\s+\d{{1,2}}$', line, re.IGNORECASE)) or \
-           bool(re.match(r'^\d{4}$', line))
+    """Check if line is a date like 'FEB 17', a garbled date like 'JAN >', or a year like '2026'."""
+    # Standard date: "FEB 17"
+    if re.match(rf'^{MONTH_PAT}\s+\d{{1,2}}$', line, re.IGNORECASE):
+        return True
+    # Garbled date: "JAN >", "MAR TT", "FEB ©" etc. (month + 1-3 non-space chars)
+    if re.match(rf'^{MONTH_PAT}\s+\S{{1,3}}$', line, re.IGNORECASE):
+        return True
+    # Year line: "2026", "2025", or garbled "5026"
+    if re.match(r'^[25]\d{3}$', line):
+        return True
+    return False
 
 
 def is_amount_line(line):
@@ -82,12 +90,48 @@ def is_header_or_footer(line):
 # OCR output: all dates first, then all descriptions, then all amounts.
 # ---------------------------------------------------------------------------
 
+def fix_garbled_day(day_str):
+    """Fix OCR-garbled day digits. Returns int or None."""
+    OCR_DAY_FIXES = {'>': '5', '<': '1', '|': '1', 'l': '1', 'I': '1',
+                     'O': '0', 'o': '0', 'Q': '0', 'D': '0',
+                     'S': '5', 's': '5', 'Z': '2', 'z': '2',
+                     'B': '8', 'G': '6', 'g': '9', 'q': '9',
+                     'T': '7', '?': '9', '!': '1', 'i': '1',
+                     'A': '4', 'b': '6', 'e': '8', 'E': '8',
+                     '©': '6', '®': '8', '°': '0', ',': '',
+                     '.': '', ';': '', ':': '', "'": ''}
+    cleaned = ''.join(OCR_DAY_FIXES.get(c, c) for c in day_str)
+    cleaned = re.sub(r'[^\d]', '', cleaned)
+    if not cleaned:
+        return None
+    try:
+        d = int(cleaned)
+        return d if 1 <= d <= 31 else None
+    except ValueError:
+        return None
+
+
 def parse_dates_from_raw(dates_raw):
     """Convert raw date lines into 'M/D/YYYY' strings."""
     dates = []
     i = 0
     while i < len(dates_raw):
+        # Try exact match first
         m = re.match(rf'^{MONTH_PAT}\s+(\d{{1,2}})$', dates_raw[i], re.IGNORECASE)
+        if not m:
+            # Try garbled day match: "MAR >" or "JAN TT" etc.
+            m2 = re.match(rf'^{MONTH_PAT}\s+(\S{{1,3}})$', dates_raw[i], re.IGNORECASE)
+            if m2:
+                day = fix_garbled_day(m2.group(2))
+                if day is not None:
+                    month = m2.group(1).upper()
+                    yr = 2026
+                    if i + 1 < len(dates_raw) and re.match(r'^\d{4}$', dates_raw[i + 1]):
+                        yr = int(dates_raw[i + 1])
+                        i += 1
+                    dates.append(f"{MONTH_MAP[month]}/{day}/{yr}")
+            i += 1
+            continue
         if m:
             month, day = m.group(1).upper(), int(m.group(2))
             yr = 2026
@@ -236,12 +280,25 @@ def parse_merged_page(text, page_num):
         day_str = date_match.group(2).strip()
 
         # Handle garbled day: OCR often misreads digits as symbols
-        OCR_DAY_FIXES = {'>': '5', '|': '1', 'l': '1', 'O': '0',
-                         'o': '0', 'S': '5', 's': '5', 'Z': '2',
-                         'z': '2', 'B': '8', 'G': '6', 'q': '9'}
+        OCR_DAY_FIXES = {'>': '5', '<': '1', '|': '1', 'l': '1', 'I': '1',
+                         'O': '0', 'o': '0', 'Q': '0', 'D': '0',
+                         'S': '5', 's': '5', 'Z': '2', 'z': '2',
+                         'B': '8', 'G': '6', 'g': '9', 'q': '9',
+                         'T': '7', '?': '9', '!': '1', 'i': '1',
+                         'A': '4', 'b': '6', 'e': '8', 'E': '8',
+                         '©': '6', '®': '8', '°': '0', ',': '',
+                         '.': '', ';': '', ':': '', "'": ''}
         cleaned_day = ''.join(OCR_DAY_FIXES.get(c, c) for c in day_str)
+        # Strip any remaining non-digit characters
+        cleaned_day = re.sub(r'[^\d]', '', cleaned_day)
+        if not cleaned_day:
+            i += 1
+            continue
         try:
             day = int(cleaned_day)
+            if day < 1 or day > 31:
+                i += 1
+                continue
         except ValueError:
             i += 1
             continue
@@ -284,6 +341,9 @@ def parse_merged_page(text, page_num):
             yr_match = re.match(r'^[25]\d{3}\b', next_line)
             if yr_match:
                 parsed_yr = int(yr_match.group(0))
+                # Handle OCR garbling: "5026" → 2026, "5025" → 2025
+                if parsed_yr >= 5000:
+                    parsed_yr -= 3000
                 if 2020 <= parsed_yr <= 2030:
                     year = parsed_yr
 
@@ -349,25 +409,65 @@ def parse_merged_page(text, page_num):
 # Unified page parser: auto-detect format and dispatch
 # ---------------------------------------------------------------------------
 
-def parse_page(img, page_num, total_pages):
-    """Parse a single page, auto-detecting whether it uses block or merged format.
+def validate_balance_chain(txns):
+    """Check how many consecutive transactions have a valid balance chain.
 
-    If default OCR produces 0 transactions (common on page 1 where dates get garbled),
-    retry with --psm 4 which often produces cleaner merged-format output.
+    Returns the number of transactions with correct running balances.
+    More valid balances = higher confidence in the parse result.
     """
-    text = pytesseract.image_to_string(img)
+    if not txns or len(txns) < 2:
+        return len(txns)
+    valid = 0
+    for i in range(1, len(txns)):
+        if txns[i-1]['balance'] is not None and txns[i]['balance'] is not None:
+            prev_bal = txns[i-1]['balance']
+            cur_bal = txns[i]['balance']
+            amt = txns[i]['amount']
+            # In reverse chronological order: prev_bal = cur_bal + amt (for credits)
+            # or prev_bal = cur_bal - amt (for debits/negative amounts)
+            expected = round(cur_bal + amt, 2)
+            if abs(prev_bal - expected) < 0.02:
+                valid += 1
+    return valid
 
-    if is_block_format(text):
-        txns = parse_block_page(text, page_num)
-    else:
-        txns = parse_merged_page(text, page_num)
 
-    # Fallback: retry with --psm 4 if no transactions found
-    if not txns:
-        text_psm4 = pytesseract.image_to_string(img, config='--psm 4')
-        txns = parse_merged_page(text_psm4, page_num)
+def parse_page(img, page_num, total_pages):
+    """Parse a single page using multiple OCR strategies, keeping the best result.
 
-    return txns
+    Tries both default and --psm 4 OCR modes with both block and merged parsers.
+    Selects the result with the most transactions. If tied, uses balance chain
+    validation to pick the more accurate parse.
+    """
+    candidates = []
+
+    # Strategy 1: Default OCR
+    text_default = pytesseract.image_to_string(img)
+    if is_block_format(text_default):
+        candidates.append(parse_block_page(text_default, page_num))
+    candidates.append(parse_merged_page(text_default, page_num))
+
+    # Strategy 2: --psm 4 (single column, often better for merged layouts)
+    text_psm4 = pytesseract.image_to_string(img, config='--psm 4')
+    if is_block_format(text_psm4):
+        candidates.append(parse_block_page(text_psm4, page_num))
+    candidates.append(parse_merged_page(text_psm4, page_num))
+
+    # Strategy 3: --psm 6 (uniform block, sometimes better for block layouts)
+    text_psm6 = pytesseract.image_to_string(img, config='--psm 6')
+    if is_block_format(text_psm6):
+        candidates.append(parse_block_page(text_psm6, page_num))
+    candidates.append(parse_merged_page(text_psm6, page_num))
+
+    # Pick the best candidate: most transactions wins; tie-break on balance chain validity
+    best = []
+    best_score = (-1, -1)
+    for c in candidates:
+        score = (len(c), validate_balance_chain(c))
+        if score > best_score:
+            best = c
+            best_score = score
+
+    return best
 
 
 def parse_account_info(img):
