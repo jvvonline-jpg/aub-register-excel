@@ -19,11 +19,6 @@ MONTH_MAP = {
 MONTH_NAMES = '|'.join(MONTH_MAP.keys())
 MONTH_PAT = rf'({MONTH_NAMES})'
 
-# Known description keywords for validation
-DESC_KEYWORDS = ['TUITION', 'FIDELITY', 'COMMONWEALTH', 'COVA', 'NETWORK',
-                 'PAYPAL', 'BANKCARD', 'FUNDS TRANSFER', 'DEPOSIT', 'TRANSFER',
-                 'PMT', 'PAYMENT', 'INVESTM', 'VENDORPAYM']
-
 
 def ocr_pdf_to_images(uploaded_file):
     """Convert uploaded PDF to page images."""
@@ -38,16 +33,22 @@ def ocr_pdf_to_images(uploaded_file):
 
 def parse_amount(text):
     """Parse a dollar amount string. Parentheses = negative (debit)."""
-    text = text.strip().rstrip(';:. ')
-    # ($1,234.56) -> negative
+    if text is None:
+        return None
+    text = text.strip().rstrip(';:., ')
     neg = re.match(r'^\(\$?([\d,]+\.\d{2})\)$', text)
     if neg:
         return -float(neg.group(1).replace(',', ''))
-    # $1,234.56 -> positive
     pos = re.match(r'^\$?([\d,]+\.\d{2})$', text)
     if pos:
         return float(pos.group(1).replace(',', ''))
     return None
+
+
+def extract_amounts_from_text(text):
+    """Extract all dollar amounts from a text string, returning (amount_str, start_pos) pairs."""
+    pattern = r'(\(?\$[\d,]+\.\d{2}\)?)'
+    return [(m.group(1), m.start()) for m in re.finditer(pattern, text)]
 
 
 def is_date_line(line):
@@ -58,33 +59,28 @@ def is_date_line(line):
 
 def is_amount_line(line):
     """Check if line is a dollar amount (positive or negative in parentheses)."""
-    cleaned = line.rstrip(';:. ')
-    # Match $1,234.56 or ($1,234.56)
+    cleaned = line.strip().rstrip(';:., ')
     return bool(re.match(r'^\(?\$?[\d,]+\.\d{2}\)?$', cleaned))
 
 
-def pair_amounts(amount_lines):
-    """Pair amount lines into (transaction_amount, running_balance) tuples.
+def is_header_or_footer(line):
+    """Check if a line is a header, footer, or other non-transaction content."""
+    skip_patterns = [
+        r'^A(?:tlantic)?$', r'^4?\s*Union Bank', r'^Good Morning',
+        r'^Old Checking', r'^Last Updated', r'^Current Balance',
+        r'^Available Balance', r'^Transactions\s+Details',
+        r'^\$[\d,]+\.\d{2}\s+\$[\d,]+\.\d{2}$',
+        r'^Date\s+Description', r'^Amount$', r'^Page totals:',
+        r'^\d+\s*-\s*\d+\s+of\s+\d', r'^[<>]+$', r'^Pending\b',
+        r'^Details\s*&\s*Settings',
+    ]
+    return any(re.match(p, line, re.IGNORECASE) for p in skip_patterns)
 
-    Each transaction has an amount followed by a running balance.
-    Negative amounts (debits) are in parentheses: ($1,234.56)
-    The running balance is always positive.
-    """
-    pairs = []
-    i = 0
-    while i < len(amount_lines):
-        amt = parse_amount(amount_lines[i])
-        bal = None
-        # The next line should be the running balance (always positive)
-        if i + 1 < len(amount_lines):
-            next_val = parse_amount(amount_lines[i + 1])
-            if next_val is not None and next_val > 0:
-                bal = next_val
-                i += 1
-        pairs.append((amt, bal))
-        i += 1
-    return pairs
 
+# ---------------------------------------------------------------------------
+# Parser for "three-block" pages (standard pages where OCR separates columns)
+# OCR output: all dates first, then all descriptions, then all amounts.
+# ---------------------------------------------------------------------------
 
 def parse_dates_from_raw(dates_raw):
     """Convert raw date lines into 'M/D/YYYY' strings."""
@@ -103,27 +99,34 @@ def parse_dates_from_raw(dates_raw):
     return dates
 
 
-def parse_standard_page(text, page_num):
-    """Parse a standard page where OCR produces three blocks: dates, descriptions, amounts.
+def pair_amounts(amount_lines):
+    """Pair consecutive amount lines into (transaction_amount, running_balance) tuples.
 
-    Works for pages 2-7 of the bank register where the three-column layout
-    produces clean block-separated OCR output.
+    Each transaction has an amount followed by a running balance.
+    The running balance is always positive. Debits are in parentheses.
+    """
+    pairs = []
+    i = 0
+    while i < len(amount_lines):
+        amt = parse_amount(amount_lines[i])
+        bal = None
+        if i + 1 < len(amount_lines):
+            next_val = parse_amount(amount_lines[i + 1])
+            if next_val is not None and next_val > 0:
+                bal = next_val
+                i += 1
+        pairs.append((amt, bal))
+        i += 1
+    return pairs
+
+
+def parse_block_page(text, page_num):
+    """Parse a page where OCR produces three clean blocks: dates, descriptions, amounts.
+
+    This is the standard format for middle pages of the bank register.
     """
     lines = [l.strip() for l in text.split('\n') if l.strip()]
-
-    skip_patterns = [
-        r'^A(?:tlantic)?$', r'^4?\s*Union Bank', r'^Good Morning',
-        r'^Old Checking', r'^Last Updated', r'^Current Balance',
-        r'^Available Balance', r'^Transactions\s+Details',
-        r'^\$[\d,]+\.\d{2}\s+\$[\d,]+\.\d{2}$',
-        r'^Date\s+Description', r'^Amount$', r'^Page totals:',
-        r'^\d+\s*-\s*\d+\s+of\s+\d', r'^[<>]+$',
-    ]
-    filtered = []
-    for line in lines:
-        if any(re.match(p, line, re.IGNORECASE) for p in skip_patterns):
-            continue
-        filtered.append(line)
+    filtered = [l for l in lines if not is_header_or_footer(l)]
 
     dates_raw = []
     descriptions = []
@@ -136,24 +139,25 @@ def parse_standard_page(text, page_num):
                 dates_raw.append(line)
             elif is_amount_line(line):
                 state = 'amounts'
-                amount_lines.append(line.rstrip(';:. '))
+                amount_lines.append(line.rstrip(';:., '))
             else:
                 state = 'descriptions'
-                if len(line) > 3:
+                if len(line) > 2:
                     descriptions.append(line)
         elif state == 'descriptions':
             if is_amount_line(line):
                 state = 'amounts'
-                amount_lines.append(line.rstrip(';:. '))
-            elif not is_date_line(line) and len(line) > 3:
+                amount_lines.append(line.rstrip(';:., '))
+            elif not is_date_line(line) and len(line) > 2:
                 descriptions.append(line)
         elif state == 'amounts':
             if is_amount_line(line):
-                amount_lines.append(line.rstrip(';:. '))
+                amount_lines.append(line.rstrip(';:., '))
 
     dates = parse_dates_from_raw(dates_raw)
     amt_pairs = pair_amounts(amount_lines)
 
+    # Use the minimum count but warn if they don't match
     n = min(len(dates), len(descriptions), len(amt_pairs))
     transactions = []
     for i in range(n):
@@ -169,205 +173,201 @@ def parse_standard_page(text, page_num):
     return transactions
 
 
-def parse_first_page(img, page_num):
-    """Parse the first page which has a header and garbled dates in full OCR.
+def is_block_format(text):
+    """Detect if OCR output is in three-block format (dates, then descriptions, then amounts).
 
-    Strategy:
-    - Crop the date column and OCR separately for clean dates
-    - Extract descriptions from full OCR by stripping garbled date prefixes
-    - Extract amounts from full OCR normally
-    """
-    w, h = img.size
-
-    # 1. Get dates from cropped date column
-    date_crop = img.crop((0, int(h * 0.42), int(w * 0.15), h))
-    date_text = pytesseract.image_to_string(date_crop, config='--psm 4')
-
-    dates = []
-    has_pending = False
-    dlines = [l.strip() for l in date_text.split('\n') if l.strip()]
-    di = 0
-    while di < len(dlines):
-        dl = dlines[di]
-        if re.match(r'^Pending', dl, re.IGNORECASE):
-            has_pending = True
-            di += 1
-            continue
-        m = re.match(rf'^{MONTH_PAT}\s+(\d{{1,2}})', dl, re.IGNORECASE)
-        if m:
-            mo, dy = m.group(1).upper(), int(m.group(2))
-            yr = 2026
-            if di + 1 < len(dlines):
-                ym = re.match(r'^(\d{4})', dlines[di + 1])
-                if ym:
-                    parsed_yr = int(ym.group(1))
-                    # Sanity check: OCR sometimes garbles year digits
-                    if 2020 <= parsed_yr <= 2030:
-                        yr = parsed_yr
-                    di += 1
-            dates.append(f"{MONTH_MAP[mo]}/{dy}/{yr}")
-        di += 1
-
-    # 2. Get descriptions and amounts from full OCR
-    full_text = pytesseract.image_to_string(img)
-    lines = [l.strip() for l in full_text.split('\n') if l.strip()]
-
-    descriptions = []
-    amount_lines = []
-
-    pending_desc_skipped = False
-    for line in lines:
-        if is_amount_line(line):
-            amount_lines.append(line.rstrip(';:. '))
-        elif any(kw in line.upper() for kw in DESC_KEYWORDS):
-            # Skip the Pending entry's description (first desc line containing "Pending")
-            if has_pending and not pending_desc_skipped and 'pending' in line.lower():
-                pending_desc_skipped = True
-                continue
-            # Strip garbled date prefix (e.g., "se TUITIONEXPRESS..." -> "TUITIONEXPRESS...")
-            best_pos = len(line)
-            for kw in DESC_KEYWORDS:
-                pos = line.upper().find(kw)
-                if pos != -1 and pos < best_pos:
-                    best_pos = pos
-            if best_pos < len(line):
-                clean_desc = line[best_pos:].strip()
-                if len(clean_desc) > 3:
-                    descriptions.append(clean_desc)
-
-    # 3. Pair amounts and handle Pending
-    amt_pairs = pair_amounts(amount_lines)
-
-    if has_pending and amt_pairs:
-        # Remove the Pending amount (first entry, no balance)
-        if amt_pairs[0][1] is None:
-            amt_pairs = amt_pairs[1:]
-        else:
-            # Pending amount was paired with the next amount as "balance"
-            # Reconstruct: drop the first value, re-pair everything
-            all_vals = []
-            if amt_pairs[0][1] is not None:
-                all_vals.append(amt_pairs[0][1])
-            for a, b in amt_pairs[1:]:
-                if a is not None:
-                    all_vals.append(a)
-                if b is not None:
-                    all_vals.append(b)
-            amt_pairs = []
-            k = 0
-            while k < len(all_vals):
-                a = all_vals[k]
-                b = None
-                if k + 1 < len(all_vals) and all_vals[k + 1] > 0:
-                    b = all_vals[k + 1]
-                    k += 1
-                amt_pairs.append((a, b))
-                k += 1
-
-    # 4. Build transactions
-    n = min(len(dates), len(descriptions), len(amt_pairs))
-    transactions = []
-    for i in range(n):
-        amt, bal = amt_pairs[i]
-        if amt is not None:
-            transactions.append({
-                'date': dates[i],
-                'page': page_num,
-                'description': descriptions[i],
-                'amount': amt,
-                'balance': bal,
-            })
-    return transactions
-
-
-def parse_last_page(text, page_num):
-    """Parse the last page where OCR may put date/desc/amount on the same lines.
-
-    On the last page (few transactions), Tesseract often merges columns into single lines like:
-    'DEC 30 FIDELITY INVESTM/GrantPaymt CORNERSTONES INC $2,200.00'
+    In block format, the first non-header lines are all dates/years,
+    then switch to non-date/non-amount text, then switch to amounts.
     """
     lines = [l.strip() for l in text.split('\n') if l.strip()]
+    filtered = [l for l in lines if not is_header_or_footer(l)]
 
-    # Filter footer
-    lines = [l for l in lines if not re.match(r'^Page totals:', l, re.IGNORECASE)
-             and not re.match(r'^\d+\s*-\s*\d+\s+of\s+\d', l)]
+    if len(filtered) < 6:
+        return False
 
-    # Collect all raw content
-    all_text = '\n'.join(lines)
+    # Check if first several lines are dates
+    date_count = 0
+    for line in filtered:
+        if is_date_line(line):
+            date_count += 1
+        else:
+            break
 
-    # Try to find date-description-amount patterns across lines
-    # Pattern: "MON DD" on one line, description (possibly with amount) on next, year+balance on next
+    # Block format has at least 4 date/year lines at the start (2 transactions minimum)
+    return date_count >= 4
+
+
+# ---------------------------------------------------------------------------
+# Parser for "merged" pages (first/last pages where OCR mixes columns)
+# Each transaction spans 2 lines:
+#   Line 1: "MON DD [description] [amount] [noise]"
+#   Line 2: "YYYY [description_cont] [balance] [noise]"
+# ---------------------------------------------------------------------------
+
+def parse_merged_page(text, page_num):
+    """Parse a page where OCR merges date/description/amount on the same lines.
+
+    Works for pages where Tesseract produces lines like:
+      'MAR 27 COVA/VENDORPAYM Cornerstones, Inc. $22,482.54'
+      '2026 $25,692.37'
+    or:
+      'JAN > COMMONWEALTH OF/ECC PMTS LAUREL LEARNING CENTER $17,331.00;'
+      '2026 $23,578.28'
+    """
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    filtered = [l for l in lines if not is_header_or_footer(l)]
+
     transactions = []
     i = 0
-    while i < len(lines):
-        line = lines[i]
+    while i < len(filtered):
+        line = filtered[i]
 
-        # Look for a date start: "DEC 30 ..." possibly with description and amount on same line
-        date_match = re.match(rf'^{MONTH_PAT}\s+(\d{{1,2}})\s+(.*)', line, re.IGNORECASE)
-        if date_match:
-            month = date_match.group(1).upper()
-            day = int(date_match.group(2))
-            rest = date_match.group(3).strip()
+        # Look for a line starting with a month name (date line)
+        # Handle garbled OCR: "JAN >" might be "JAN 5", "MAR 27°" etc.
+        date_match = re.match(
+            rf'^{MONTH_PAT}\s+(\S{{1,2}})',
+            line, re.IGNORECASE
+        )
+        if not date_match:
+            i += 1
+            continue
 
-            # Extract amount from the rest if present
-            amt_in_line = re.search(r'(\(?\$[\d,]+\.\d{2}\)?)\s*[;:.]?\s*$', rest)
-            if amt_in_line:
-                amount_str = amt_in_line.group(1)
-                desc_part = rest[:amt_in_line.start()].strip()
-            else:
-                amount_str = None
-                desc_part = rest
+        month = date_match.group(1).upper()
+        day_str = date_match.group(2).strip()
 
-            desc_part = desc_part.strip().rstrip(':;.')
+        # Handle garbled day: OCR often misreads digits as symbols
+        OCR_DAY_FIXES = {'>': '5', '|': '1', 'l': '1', 'O': '0',
+                         'o': '0', 'S': '5', 's': '5', 'Z': '2',
+                         'z': '2', 'B': '8', 'G': '6', 'q': '9'}
+        cleaned_day = ''.join(OCR_DAY_FIXES.get(c, c) for c in day_str)
+        try:
+            day = int(cleaned_day)
+        except ValueError:
+            i += 1
+            continue
 
-            # Look ahead for description (if not on date line) and year/balance
-            year = 2026
-            balance = None
+        rest_of_line = line[date_match.end():].strip()
 
-            # If description is empty, the next line may have it
-            if not desc_part and i + 1 < len(lines):
-                next_line = lines[i + 1].strip()
-                if any(kw in next_line.upper() for kw in DESC_KEYWORDS):
-                    desc_part = next_line.rstrip(':;.')
-                    i += 1
+        # Extract amounts from the rest of the date line
+        amounts_in_line = extract_amounts_from_text(rest_of_line)
 
-            # Next line after description should be year + balance
-            if i + 1 < len(lines):
-                next_line = lines[i + 1].strip()
-                yr_match = re.match(r'^(\d{4})\s*(.*)', next_line)
-                if yr_match:
-                    year = int(yr_match.group(1))
-                    rest2 = yr_match.group(2).strip()
-                    bal_match = re.search(r'(\$[\d,]+\.\d{2})', rest2)
-                    if bal_match:
-                        balance = parse_amount(bal_match.group(1))
-                    i += 1
+        # Get description: everything before the first amount
+        if amounts_in_line:
+            first_amt_pos = amounts_in_line[0][1]
+            desc_part = rest_of_line[:first_amt_pos].strip().rstrip(':;., ')
+            txn_amount_str = amounts_in_line[0][0]
+        else:
+            desc_part = rest_of_line.strip().rstrip(':;., ')
+            txn_amount_str = None
 
-            amount = parse_amount(amount_str) if amount_str else None
+        # Clean description: remove leading symbols like "_ ", "= ", "°"
+        desc_part = re.sub(r'^[_=°®\s]+', '', desc_part).strip()
 
-            if desc_part and amount is not None:
-                # Clean description: find earliest keyword match position
-                # but keep the full description if it starts reasonably
-                best_pos = len(desc_part)
-                for kw in DESC_KEYWORDS:
-                    pos = desc_part.upper().find(kw)
-                    if pos != -1 and pos < best_pos:
-                        best_pos = pos
-                if best_pos > 0 and best_pos < len(desc_part):
-                    desc_part = desc_part[best_pos:]
+        # Handle 3-line format: date+amount, description, year+balance
+        # e.g.: "DEC 30 $2,200.00" / "FIDELITY INVESTM/..." / "2025 $3,667.53"
+        if not desc_part and i + 1 < len(filtered):
+            peek = filtered[i + 1]
+            # If next line is not a date, not a year, and not a header → it's a description
+            if not re.match(rf'^{MONTH_PAT}\s+', peek, re.IGNORECASE) and \
+               not re.match(r'^[25]\d{3}\b', peek) and \
+               not is_header_or_footer(peek) and \
+               not is_amount_line(peek):
+                desc_part = re.sub(r'^[_=°®©@&\s]+', '', peek).strip().rstrip(':;., ')
+                i += 1  # consumed the description line
 
-                date_str = f"{MONTH_MAP[month]}/{day}/{year}"
-                transactions.append({
-                    'date': date_str,
-                    'page': page_num,
-                    'description': desc_part.strip(),
-                    'amount': amount,
-                    'balance': balance,
-                })
+        # Look at next line for year and/or balance
+        year = 2026
+        balance = None
+
+        if i + 1 < len(filtered):
+            next_line = filtered[i + 1]
+            yr_match = re.match(r'^[25]\d{3}\b', next_line)
+            if yr_match:
+                parsed_yr = int(yr_match.group(0))
+                if 2020 <= parsed_yr <= 2030:
+                    year = parsed_yr
+
+                year_rest = next_line[yr_match.end():].strip()
+
+                # The year line might also contain description and/or balance
+                amounts_in_year = extract_amounts_from_text(year_rest)
+
+                if amounts_in_year:
+                    # Text before the amount on the year line could be description
+                    year_desc = year_rest[:amounts_in_year[0][1]].strip().rstrip(':;., ')
+                    year_desc = re.sub(r'^[_=°®\s]+', '', year_desc).strip()
+
+                    if not desc_part and year_desc:
+                        desc_part = year_desc
+                    elif year_desc and not any(c.isalpha() for c in desc_part):
+                        desc_part = year_desc
+
+                    # Balance is typically the last amount on the year line
+                    balance = parse_amount(amounts_in_year[-1][0])
+
+                    # If there's no txn amount from the date line,
+                    # and the year line has 2 amounts, first is amount, second is balance
+                    if txn_amount_str is None and len(amounts_in_year) >= 2:
+                        txn_amount_str = amounts_in_year[0][0]
+                        balance = parse_amount(amounts_in_year[1][0])
+                elif not desc_part:
+                    # Year line has no amounts - might be pure description
+                    year_desc = year_rest.strip().rstrip(':;., ')
+                    year_desc = re.sub(r'^[_=°®\s]+', '', year_desc).strip()
+                    if year_desc:
+                        desc_part = year_desc
+
+                i += 1  # consumed the year line
+
+        txn_amount = parse_amount(txn_amount_str) if txn_amount_str else None
+        date_str = f"{MONTH_MAP[month]}/{day}/{year}"
+
+        if txn_amount is not None and desc_part:
+            transactions.append({
+                'date': date_str,
+                'page': page_num,
+                'description': desc_part,
+                'amount': txn_amount,
+                'balance': balance,
+            })
+        elif txn_amount is not None:
+            # Transaction with amount but no description (e.g., DEPOSIT)
+            transactions.append({
+                'date': date_str,
+                'page': page_num,
+                'description': 'DEPOSIT',
+                'amount': txn_amount,
+                'balance': balance,
+            })
 
         i += 1
 
     return transactions
+
+
+# ---------------------------------------------------------------------------
+# Unified page parser: auto-detect format and dispatch
+# ---------------------------------------------------------------------------
+
+def parse_page(img, page_num, total_pages):
+    """Parse a single page, auto-detecting whether it uses block or merged format.
+
+    If default OCR produces 0 transactions (common on page 1 where dates get garbled),
+    retry with --psm 4 which often produces cleaner merged-format output.
+    """
+    text = pytesseract.image_to_string(img)
+
+    if is_block_format(text):
+        txns = parse_block_page(text, page_num)
+    else:
+        txns = parse_merged_page(text, page_num)
+
+    # Fallback: retry with --psm 4 if no transactions found
+    if not txns:
+        text_psm4 = pytesseract.image_to_string(img, config='--psm 4')
+        txns = parse_merged_page(text_psm4, page_num)
+
+    return txns
 
 
 def parse_account_info(img):
@@ -403,9 +403,9 @@ def build_excel(transactions, account_name):
     transactions.reverse()
 
     # Beginning balance = first transaction's balance minus its amount
-    if transactions:
+    if transactions and transactions[0]['balance'] is not None:
         first = transactions[0]
-        beginning_balance = round((first['balance'] or 0) - first['amount'], 2)
+        beginning_balance = round(first['balance'] - first['amount'], 2)
     else:
         beginning_balance = 0
 
@@ -495,15 +495,7 @@ if uploaded_file:
             all_transactions = []
 
             for page_num, img in enumerate(images, 1):
-                text = pytesseract.image_to_string(img)
-
-                if page_num == 1:
-                    txns = parse_first_page(img, page_num)
-                elif page_num == len(images):
-                    txns = parse_last_page(text, page_num)
-                else:
-                    txns = parse_standard_page(text, page_num)
-
+                txns = parse_page(img, page_num, len(images))
                 all_transactions.extend(txns)
 
         st.success(f"Found {len(all_transactions)} transactions from '{account_name}'")
