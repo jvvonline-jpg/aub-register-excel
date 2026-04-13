@@ -5,6 +5,7 @@ from pdf2image import convert_from_path
 import pytesseract
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+from openpyxl.workbook.properties import CalcProperties
 import tempfile
 import os
 
@@ -240,6 +241,13 @@ def parse_merged_page(text, page_num):
             rf'^{MONTH_PAT}\s+(\S{{1,2}})',
             line, re.IGNORECASE
         )
+        # Fallback: OCR often omits the space between month and day digit
+        # e.g. "APR7  COVA/VENDORPAYM..." or "APR3 MERCHANT BNKCD/..."
+        if not date_match:
+            date_match = re.match(
+                rf'^{MONTH_PAT}(\d{{1,2}})\b',
+                line, re.IGNORECASE
+            )
         if not date_match:
             i += 1
             continue
@@ -565,6 +573,9 @@ def build_excel(transactions, account_name):
     ws.column_dimensions['G'].width = 18
     ws.column_dimensions['H'].width = 24
     ws.freeze_panes = 'A2'
+
+    # Force Excel/Sheets to recalculate all formulas when file is opened
+    wb.calculation = CalcProperties(fullCalcOnLoad=True)
 
     return wb
 
