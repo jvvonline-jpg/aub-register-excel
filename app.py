@@ -196,7 +196,11 @@ def parse_block_page(text, page_num):
                 state = 'amounts'
                 amount_lines.append(line.rstrip(';:., '))
             elif not is_date_line(line) and len(line) > 2:
-                descriptions.append(line)
+                # Merge continuation lines (previous line ends with \)
+                if descriptions and descriptions[-1].rstrip().endswith('\\'):
+                    descriptions[-1] = descriptions[-1].rstrip().rstrip('\\').strip() + ' ' + line
+                else:
+                    descriptions.append(line)
         elif state == 'amounts':
             if is_amount_line(line):
                 amount_lines.append(line.rstrip(';:., '))
@@ -250,7 +254,7 @@ def parse_block_page(text, page_num):
                         'amount': amt, 'balance': bal,
                     })
             score = validate_balance_chain(trial_txns)
-            if score > best_chain:
+            if score >= best_chain:
                 best_chain = score
                 best_descs = candidate[:n]
         descriptions = best_descs
