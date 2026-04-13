@@ -85,6 +85,150 @@ def is_header_or_footer(line):
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Positional parser: uses bounding-box data + font-height to correctly match
+# each description row with its transaction amount regardless of OCR read order.
+# Large-font numbers (h >= 42) = transaction amounts
+# Small-font numbers (h < 42)  = running balances
+# ---------------------------------------------------------------------------
+
+MIN_TXN_HEIGHT = 42  # pixels at 300 dpi; amounts with h >= this are txn amounts
+
+def parse_page_positional(img, page_num):
+    """Parse a page using bounding-box positions and font size (calls image_to_data)."""
+    data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+    return parse_page_positional_from_data(data, page_num)
+
+
+def parse_page_positional_from_data(data, page_num):
+    """Parse using pre-computed image_to_data output."""
+    elements = []
+    for i, text in enumerate(data['text']):
+        t = text.strip()
+        if not t:
+            continue
+        elements.append({
+            'text': t, 'x': data['left'][i], 'y': data['top'][i],
+            'h': data['height'][i], 'w': data['width'][i],
+        })
+
+    # --- Identify transaction amounts (large font) and running balances (small font) ---
+    amt_pattern = re.compile(r'^\(?\$[\d,]+\.\d{2}\)?$')
+    txn_amts = []  # large-font dollar amounts
+    bal_amts = []  # small-font dollar amounts
+    for el in elements:
+        if amt_pattern.match(el['text']):
+            if el['h'] >= MIN_TXN_HEIGHT:
+                txn_amts.append(el)
+            else:
+                bal_amts.append(el)
+
+    txn_amts.sort(key=lambda e: e['y'])
+    bal_amts.sort(key=lambda e: e['y'])
+
+    if not txn_amts:
+        return []
+
+    # --- Define vertical bands: one per transaction ---
+    # Band i runs from midpoint(i-1,i) to midpoint(i,i+1)
+    bands = []
+    for i, ta in enumerate(txn_amts):
+        y_start = 0 if i == 0 else (txn_amts[i - 1]['y'] + ta['y']) // 2
+        y_end = (
+            max(el['y'] for el in elements) + 100
+            if i == len(txn_amts) - 1
+            else (ta['y'] + txn_amts[i + 1]['y']) // 2
+        )
+        bands.append((y_start, y_end, ta))
+
+    # --- Extract transactions from each band ---
+    transactions = []
+    for y_start, y_end, txn_el in bands:
+        band_els = [el for el in elements if y_start <= el['y'] < y_end]
+
+        month = None
+        day = None
+        year = 2026
+        balance = None
+        desc_parts = []
+
+        for el in band_els:
+            text = el['text']
+
+            # Skip the transaction amount itself
+            if el is txn_el:
+                continue
+
+            # Running balance (small-font dollar amount)
+            if amt_pattern.match(text) and el['h'] < MIN_TXN_HEIGHT:
+                balance = parse_amount(text)
+                continue
+
+            # Skip any other dollar amounts
+            if amt_pattern.match(text):
+                continue
+
+            # Month name
+            if text.upper() in MONTH_MAP and month is None:
+                month = text.upper()
+                continue
+
+            # Year (2026, 5026→2026 etc.)
+            if re.match(r'^[25]\d{3}$', text):
+                yr = int(text)
+                if yr >= 5000:
+                    yr -= 3000
+                if 2020 <= yr <= 2030:
+                    year = yr
+                continue
+
+            # Day digit
+            if re.match(r'^\d{1,2}$', text):
+                d = int(text)
+                if 1 <= d <= 31:
+                    day = d
+                    continue
+
+            # Garbled day (©, >, etc.) next to a month
+            if month is not None and day is None and len(text) <= 3:
+                fd = fix_garbled_day(text)
+                if fd is not None:
+                    day = fd
+                    continue
+
+            # Skip header/footer and tiny fragments
+            if is_header_or_footer(text):
+                continue
+            if len(text) <= 1 and not text.isalpha():
+                continue
+
+            # Description word — keep with x position for ordering
+            desc_parts.append((el['x'], text))
+
+        # Build description string left-to-right
+        desc_parts.sort(key=lambda p: p[0])
+        desc = ' '.join(t for _, t in desc_parts).strip()
+        desc = re.sub(r'^[©@&=\-_°®\s]+', '', desc).strip()
+        desc = desc.rstrip(':;., ')
+
+        txn_amt = parse_amount(txn_el['text'])
+
+        if txn_amt is not None and month:
+            if day is None:
+                day = 1
+            date_str = f"{MONTH_MAP[month]}/{day}/{year}"
+            transactions.append({
+                'date': date_str,
+                'page': page_num,
+                'description': desc or 'UNKNOWN',
+                'amount': txn_amt,
+                'balance': balance,
+            })
+
+    return transactions
+
+
+# ---------------------------------------------------------------------------
 # Parser for "three-block" pages (standard pages where OCR separates columns)
 # OCR output: all dates first, then all descriptions, then all amounts.
 # ---------------------------------------------------------------------------
@@ -441,30 +585,53 @@ def parse_merged_page(text, page_num):
 # ---------------------------------------------------------------------------
 
 def validate_balance_chain(txns):
-    """Check how many consecutive transactions have a valid balance chain."""
+    """Check how many consecutive transactions have a valid balance chain.
+
+    Transactions are in reverse chronological order (newest first).
+    Relationship: balance[i-1] = balance[i] + amount[i-1]
+    (the more-recent balance equals the older balance plus the more-recent amount)
+    """
     if not txns or len(txns) < 2:
         return len(txns)
     valid = 0
     for i in range(1, len(txns)):
         if txns[i-1]['balance'] is not None and txns[i]['balance'] is not None:
-            prev_bal = txns[i-1]['balance']
-            cur_bal = txns[i]['balance']
-            amt = txns[i]['amount']
-            expected = round(cur_bal + amt, 2)
-            if abs(prev_bal - expected) < 0.02:
+            newer_bal = txns[i - 1]['balance']
+            older_bal = txns[i]['balance']
+            newer_amt = txns[i - 1]['amount']
+            expected = round(older_bal + newer_amt, 2)
+            if abs(newer_bal - expected) < 0.02:
                 valid += 1
     return valid
+
+
+def _text_from_data(data):
+    """Reconstruct page text from image_to_data() output (grouped by line)."""
+    lines = {}
+    for i, text in enumerate(data['text']):
+        t = text.strip()
+        if not t:
+            continue
+        key = (data['block_num'][i], data['par_num'][i], data['line_num'][i])
+        lines.setdefault(key, []).append(t)
+    sorted_keys = sorted(lines.keys())
+    return '\n'.join(' '.join(lines[k]) for k in sorted_keys)
 
 
 def parse_page(img, page_num, total_pages):
     """Parse a single page using multiple OCR strategies, keeping the best result."""
     candidates = []
 
-    text_default = pytesseract.image_to_string(img)
-    if is_block_format(text_default):
+    # --- Default OCR: use image_to_data() to get BOTH text and bounding boxes ---
+    # This avoids a separate image_to_string() call (saves ~1.5s per page).
+    ocr_data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+    text_default = _text_from_data(ocr_data)
+    is_block_default = is_block_format(text_default)
+    if is_block_default:
         candidates.append(parse_block_page(text_default, page_num))
     candidates.append(parse_merged_page(text_default, page_num))
 
+    # --- Additional PSM modes (text-only; no bounding boxes needed) ---
     text_psm4 = pytesseract.image_to_string(img, config='--psm 4')
     if is_block_format(text_psm4):
         candidates.append(parse_block_page(text_psm4, page_num))
@@ -475,6 +642,7 @@ def parse_page(img, page_num, total_pages):
         candidates.append(parse_block_page(text_psm6, page_num))
     candidates.append(parse_merged_page(text_psm6, page_num))
 
+    # Pick best text-based result
     best = []
     best_score = (-1, -1)
     for c in candidates:
@@ -482,6 +650,18 @@ def parse_page(img, page_num, total_pages):
         if score > best_score:
             best = c
             best_score = score
+
+    # --- Positional parser (bounding-box + font-size) ---
+    # Re-uses the ocr_data already obtained above — no extra OCR call.
+    # Matches descriptions to amounts by spatial position, fixing cases
+    # where the block parser misaligns them.
+    has_block = is_block_default or is_block_format(text_psm4) or is_block_format(text_psm6)
+    if has_block:
+        pos = parse_page_positional_from_data(ocr_data, page_num)
+        pos_score = (len(pos), validate_balance_chain(pos))
+        if pos_score >= best_score:
+            best = pos
+            best_score = pos_score
 
     return best
 
