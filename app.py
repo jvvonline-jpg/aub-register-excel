@@ -73,8 +73,9 @@ def is_header_or_footer(line):
     """Check if a line is a header, footer, or other non-transaction content."""
     skip_patterns = [
         r'^A(?:tlantic)?$', r'^4?\s*Union Bank', r'^Good Morning',
-        r'^Old Checking', r'^Last Updated', r'^Current Balance',
-        r'^Available Balance', r'^Transactions\s+Details',
+        r'^Old Checking', r'^Operations\s+Checking', r'^Last Updated',
+        r'^Current Balance', r'^Available Balance',
+        r'^Transactions\s+Details',
         r'^\$[\d,]+\.\d{2}\s+\$[\d,]+\.\d{2}$',
         r'^Date\s+Description', r'^Amount$', r'^Page totals:',
         r'^\d+\s*-\s*\d+\s+of\s+\d', r'^[<>]+$', r'^Pending\b',
@@ -164,16 +165,29 @@ def parse_block_page(text, page_num):
     dates_raw = []
     descriptions = []
     amount_lines = []
+    stray_amounts = []  # (date_count_so_far, amount_string)
     state = 'dates'
 
-    for line in filtered:
+    for idx, line in enumerate(filtered):
         if state == 'dates':
             if is_date_line(line):
                 dates_raw.append(line)
             elif is_amount_line(line):
+                # Check if more dates follow (stray amount in date section)
+                lookahead = filtered[idx+1:idx+4]
+                dates_ahead = sum(1 for l in lookahead if is_date_line(l))
+                if dates_ahead >= 2:
+                    # Capture stray amount with current date count for reinsertion
+                    stray_amounts.append((len(dates_raw), line.rstrip(';:., ')))
+                    continue
                 state = 'amounts'
                 amount_lines.append(line.rstrip(';:., '))
             else:
+                # Check if more dates follow (stray text in date section)
+                lookahead = filtered[idx+1:idx+4]
+                dates_ahead = sum(1 for l in lookahead if is_date_line(l))
+                if dates_ahead >= 2:
+                    continue
                 state = 'descriptions'
                 if len(line) > 2:
                     descriptions.append(line)
@@ -187,10 +201,62 @@ def parse_block_page(text, page_num):
             if is_amount_line(line):
                 amount_lines.append(line.rstrip(';:., '))
 
+    # Re-insert stray amounts at the best position (maximise balance chain)
+    for stray_date_idx, stray_val in stray_amounts:
+        dates_tmp = parse_dates_from_raw(dates_raw)
+        best_pos = stray_date_idx * 2        # default: position by date index
+        best_score = -1
+        # Try every even position (each transaction contributes 2 lines: amount + balance)
+        for pos in range(0, len(amount_lines) + 1, 2):
+            trial = amount_lines[:pos] + [stray_val] + amount_lines[pos:]
+            trial_pairs = pair_amounts(trial)
+            tn = min(len(dates_tmp), len(descriptions), len(trial_pairs))
+            trial_txns = []
+            for ti in range(tn):
+                tamt, tbal = trial_pairs[ti]
+                if tamt is not None:
+                    trial_txns.append({
+                        'date': dates_tmp[ti], 'page': page_num,
+                        'description': descriptions[ti] if ti < len(descriptions) else '',
+                        'amount': tamt, 'balance': tbal,
+                    })
+            score = validate_balance_chain(trial_txns)
+            if score > best_score:
+                best_score = score
+                best_pos = pos
+        amount_lines.insert(best_pos, stray_val)
+
     dates = parse_dates_from_raw(dates_raw)
     amt_pairs = pair_amounts(amount_lines)
 
-    n = min(len(dates), len(descriptions), len(amt_pairs))
+    n = min(len(dates), len(amt_pairs))
+
+    # --- Description alignment: remove excess descriptions guided by balance chain ---
+    if len(descriptions) > n:
+        excess = len(descriptions) - n
+        best_descs = descriptions[:n]
+        best_chain = -1
+        # Try removing a consecutive block of 'excess' descriptions at each start position
+        for start in range(len(descriptions) - excess + 1):
+            candidate = descriptions[:start] + descriptions[start + excess:]
+            candidate = candidate[:n]
+            trial_txns = []
+            for i in range(min(n, len(candidate))):
+                amt, bal = amt_pairs[i]
+                if amt is not None:
+                    trial_txns.append({
+                        'date': dates[i], 'page': page_num,
+                        'description': candidate[i],
+                        'amount': amt, 'balance': bal,
+                    })
+            score = validate_balance_chain(trial_txns)
+            if score > best_chain:
+                best_chain = score
+                best_descs = candidate[:n]
+        descriptions = best_descs
+    else:
+        descriptions = descriptions[:n]
+
     transactions = []
     for i in range(n):
         amt, bal = amt_pairs[i]
@@ -198,7 +264,7 @@ def parse_block_page(text, page_num):
             transactions.append({
                 'date': dates[i],
                 'page': page_num,
-                'description': descriptions[i],
+                'description': descriptions[i] if i < len(descriptions) else '',
                 'amount': amt,
                 'balance': bal,
             })
@@ -206,21 +272,23 @@ def parse_block_page(text, page_num):
 
 
 def is_block_format(text):
-    """Detect if OCR output is in three-block format."""
+    """Detect if OCR output is in three-block format.
+
+    Tolerates stray amount/text lines among the leading dates.
+    If the first ~20 lines are predominantly dates (>60%), it's block format.
+    """
     lines = [l.strip() for l in text.split('\n') if l.strip()]
     filtered = [l for l in lines if not is_header_or_footer(l)]
 
     if len(filtered) < 6:
         return False
 
-    date_count = 0
-    for line in filtered:
-        if is_date_line(line):
-            date_count += 1
-        else:
-            break
+    # Check the first 20 filtered lines (or all if fewer)
+    check_count = min(20, len(filtered))
+    date_count = sum(1 for l in filtered[:check_count] if is_date_line(l))
 
-    return date_count >= 4
+    # Block format if the leading section is dominated by dates
+    return date_count >= 4 and date_count / check_count > 0.6
 
 
 # ---------------------------------------------------------------------------
