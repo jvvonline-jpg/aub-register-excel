@@ -53,13 +53,10 @@ def extract_amounts_from_text(text):
 
 def is_date_line(line):
     """Check if line is a date like 'FEB 17', a garbled date like 'JAN >', or a year like '2026'."""
-    # Standard date: "FEB 17"
     if re.match(rf'^{MONTH_PAT}\s+\d{{1,2}}$', line, re.IGNORECASE):
         return True
-    # Garbled date: "JAN >", "MAR TT", "FEB ©" etc. (month + 1-3 non-space chars)
     if re.match(rf'^{MONTH_PAT}\s+\S{{1,3}}$', line, re.IGNORECASE):
         return True
-    # Year line: "2026", "2025", or garbled "5026"
     if re.match(r'^[25]\d{3}$', line):
         return True
     return False
@@ -116,10 +113,8 @@ def parse_dates_from_raw(dates_raw):
     dates = []
     i = 0
     while i < len(dates_raw):
-        # Try exact match first
         m = re.match(rf'^{MONTH_PAT}\s+(\d{{1,2}})$', dates_raw[i], re.IGNORECASE)
         if not m:
-            # Try garbled day match: "MAR >" or "JAN TT" etc.
             m2 = re.match(rf'^{MONTH_PAT}\s+(\S{{1,3}})$', dates_raw[i], re.IGNORECASE)
             if m2:
                 day = fix_garbled_day(m2.group(2))
@@ -144,11 +139,7 @@ def parse_dates_from_raw(dates_raw):
 
 
 def pair_amounts(amount_lines):
-    """Pair consecutive amount lines into (transaction_amount, running_balance) tuples.
-
-    Each transaction has an amount followed by a running balance.
-    The running balance is always positive. Debits are in parentheses.
-    """
+    """Pair consecutive amount lines into (transaction_amount, running_balance) tuples."""
     pairs = []
     i = 0
     while i < len(amount_lines):
@@ -165,10 +156,7 @@ def pair_amounts(amount_lines):
 
 
 def parse_block_page(text, page_num):
-    """Parse a page where OCR produces three clean blocks: dates, descriptions, amounts.
-
-    This is the standard format for middle pages of the bank register.
-    """
+    """Parse a page where OCR produces three clean blocks: dates, descriptions, amounts."""
     lines = [l.strip() for l in text.split('\n') if l.strip()]
     filtered = [l for l in lines if not is_header_or_footer(l)]
 
@@ -201,7 +189,6 @@ def parse_block_page(text, page_num):
     dates = parse_dates_from_raw(dates_raw)
     amt_pairs = pair_amounts(amount_lines)
 
-    # Use the minimum count but warn if they don't match
     n = min(len(dates), len(descriptions), len(amt_pairs))
     transactions = []
     for i in range(n):
@@ -218,18 +205,13 @@ def parse_block_page(text, page_num):
 
 
 def is_block_format(text):
-    """Detect if OCR output is in three-block format (dates, then descriptions, then amounts).
-
-    In block format, the first non-header lines are all dates/years,
-    then switch to non-date/non-amount text, then switch to amounts.
-    """
+    """Detect if OCR output is in three-block format."""
     lines = [l.strip() for l in text.split('\n') if l.strip()]
     filtered = [l for l in lines if not is_header_or_footer(l)]
 
     if len(filtered) < 6:
         return False
 
-    # Check if first several lines are dates
     date_count = 0
     for line in filtered:
         if is_date_line(line):
@@ -237,27 +219,15 @@ def is_block_format(text):
         else:
             break
 
-    # Block format has at least 4 date/year lines at the start (2 transactions minimum)
     return date_count >= 4
 
 
 # ---------------------------------------------------------------------------
 # Parser for "merged" pages (first/last pages where OCR mixes columns)
-# Each transaction spans 2 lines:
-#   Line 1: "MON DD [description] [amount] [noise]"
-#   Line 2: "YYYY [description_cont] [balance] [noise]"
 # ---------------------------------------------------------------------------
 
 def parse_merged_page(text, page_num):
-    """Parse a page where OCR merges date/description/amount on the same lines.
-
-    Works for pages where Tesseract produces lines like:
-      'MAR 27 COVA/VENDORPAYM Cornerstones, Inc. $22,482.54'
-      '2026 $25,692.37'
-    or:
-      'JAN > COMMONWEALTH OF/ECC PMTS LAUREL LEARNING CENTER $17,331.00;'
-      '2026 $23,578.28'
-    """
+    """Parse a page where OCR merges date/description/amount on the same lines."""
     lines = [l.strip() for l in text.split('\n') if l.strip()]
     filtered = [l for l in lines if not is_header_or_footer(l)]
 
@@ -266,8 +236,6 @@ def parse_merged_page(text, page_num):
     while i < len(filtered):
         line = filtered[i]
 
-        # Look for a line starting with a month name (date line)
-        # Handle garbled OCR: "JAN >" might be "JAN 5", "MAR 27°" etc.
         date_match = re.match(
             rf'^{MONTH_PAT}\s+(\S{{1,2}})',
             line, re.IGNORECASE
@@ -279,7 +247,6 @@ def parse_merged_page(text, page_num):
         month = date_match.group(1).upper()
         day_str = date_match.group(2).strip()
 
-        # Handle garbled day: OCR often misreads digits as symbols
         OCR_DAY_FIXES = {'>': '5', '<': '1', '|': '1', 'l': '1', 'I': '1',
                          'O': '0', 'o': '0', 'Q': '0', 'D': '0',
                          'S': '5', 's': '5', 'Z': '2', 'z': '2',
@@ -289,7 +256,6 @@ def parse_merged_page(text, page_num):
                          '©': '6', '®': '8', '°': '0', ',': '',
                          '.': '', ';': '', ':': '', "'": ''}
         cleaned_day = ''.join(OCR_DAY_FIXES.get(c, c) for c in day_str)
-        # Strip any remaining non-digit characters
         cleaned_day = re.sub(r'[^\d]', '', cleaned_day)
         if not cleaned_day:
             i += 1
@@ -305,10 +271,8 @@ def parse_merged_page(text, page_num):
 
         rest_of_line = line[date_match.end():].strip()
 
-        # Extract amounts from the rest of the date line
         amounts_in_line = extract_amounts_from_text(rest_of_line)
 
-        # Get description: everything before the first amount
         if amounts_in_line:
             first_amt_pos = amounts_in_line[0][1]
             desc_part = rest_of_line[:first_amt_pos].strip().rstrip(':;., ')
@@ -317,22 +281,17 @@ def parse_merged_page(text, page_num):
             desc_part = rest_of_line.strip().rstrip(':;., ')
             txn_amount_str = None
 
-        # Clean description: remove leading symbols like "_ ", "= ", "°"
         desc_part = re.sub(r'^[_=°®\s]+', '', desc_part).strip()
 
-        # Handle 3-line format: date+amount, description, year+balance
-        # e.g.: "DEC 30 $2,200.00" / "FIDELITY INVESTM/..." / "2025 $3,667.53"
         if not desc_part and i + 1 < len(filtered):
             peek = filtered[i + 1]
-            # If next line is not a date, not a year, and not a header → it's a description
             if not re.match(rf'^{MONTH_PAT}\s+', peek, re.IGNORECASE) and \
                not re.match(r'^[25]\d{3}\b', peek) and \
                not is_header_or_footer(peek) and \
                not is_amount_line(peek):
                 desc_part = re.sub(r'^[_=°®©@&\s]+', '', peek).strip().rstrip(':;., ')
-                i += 1  # consumed the description line
+                i += 1
 
-        # Look at next line for year and/or balance
         year = 2026
         balance = None
 
@@ -341,7 +300,6 @@ def parse_merged_page(text, page_num):
             yr_match = re.match(r'^[25]\d{3}\b', next_line)
             if yr_match:
                 parsed_yr = int(yr_match.group(0))
-                # Handle OCR garbling: "5026" → 2026, "5025" → 2025
                 if parsed_yr >= 5000:
                     parsed_yr -= 3000
                 if 2020 <= parsed_yr <= 2030:
@@ -349,11 +307,9 @@ def parse_merged_page(text, page_num):
 
                 year_rest = next_line[yr_match.end():].strip()
 
-                # The year line might also contain description and/or balance
                 amounts_in_year = extract_amounts_from_text(year_rest)
 
                 if amounts_in_year:
-                    # Text before the amount on the year line could be description
                     year_desc = year_rest[:amounts_in_year[0][1]].strip().rstrip(':;., ')
                     year_desc = re.sub(r'^[_=°®\s]+', '', year_desc).strip()
 
@@ -362,22 +318,18 @@ def parse_merged_page(text, page_num):
                     elif year_desc and not any(c.isalpha() for c in desc_part):
                         desc_part = year_desc
 
-                    # Balance is typically the last amount on the year line
                     balance = parse_amount(amounts_in_year[-1][0])
 
-                    # If there's no txn amount from the date line,
-                    # and the year line has 2 amounts, first is amount, second is balance
                     if txn_amount_str is None and len(amounts_in_year) >= 2:
                         txn_amount_str = amounts_in_year[0][0]
                         balance = parse_amount(amounts_in_year[1][0])
                 elif not desc_part:
-                    # Year line has no amounts - might be pure description
                     year_desc = year_rest.strip().rstrip(':;., ')
                     year_desc = re.sub(r'^[_=°®\s]+', '', year_desc).strip()
                     if year_desc:
                         desc_part = year_desc
 
-                i += 1  # consumed the year line
+                i += 1
 
         txn_amount = parse_amount(txn_amount_str) if txn_amount_str else None
         date_str = f"{MONTH_MAP[month]}/{day}/{year}"
@@ -391,7 +343,6 @@ def parse_merged_page(text, page_num):
                 'balance': balance,
             })
         elif txn_amount is not None:
-            # Transaction with amount but no description (e.g., DEPOSIT)
             transactions.append({
                 'date': date_str,
                 'page': page_num,
@@ -410,11 +361,7 @@ def parse_merged_page(text, page_num):
 # ---------------------------------------------------------------------------
 
 def validate_balance_chain(txns):
-    """Check how many consecutive transactions have a valid balance chain.
-
-    Returns the number of transactions with correct running balances.
-    More valid balances = higher confidence in the parse result.
-    """
+    """Check how many consecutive transactions have a valid balance chain."""
     if not txns or len(txns) < 2:
         return len(txns)
     valid = 0
@@ -423,8 +370,6 @@ def validate_balance_chain(txns):
             prev_bal = txns[i-1]['balance']
             cur_bal = txns[i]['balance']
             amt = txns[i]['amount']
-            # In reverse chronological order: prev_bal = cur_bal + amt (for credits)
-            # or prev_bal = cur_bal - amt (for debits/negative amounts)
             expected = round(cur_bal + amt, 2)
             if abs(prev_bal - expected) < 0.02:
                 valid += 1
@@ -432,33 +377,24 @@ def validate_balance_chain(txns):
 
 
 def parse_page(img, page_num, total_pages):
-    """Parse a single page using multiple OCR strategies, keeping the best result.
-
-    Tries both default and --psm 4 OCR modes with both block and merged parsers.
-    Selects the result with the most transactions. If tied, uses balance chain
-    validation to pick the more accurate parse.
-    """
+    """Parse a single page using multiple OCR strategies, keeping the best result."""
     candidates = []
 
-    # Strategy 1: Default OCR
     text_default = pytesseract.image_to_string(img)
     if is_block_format(text_default):
         candidates.append(parse_block_page(text_default, page_num))
     candidates.append(parse_merged_page(text_default, page_num))
 
-    # Strategy 2: --psm 4 (single column, often better for merged layouts)
     text_psm4 = pytesseract.image_to_string(img, config='--psm 4')
     if is_block_format(text_psm4):
         candidates.append(parse_block_page(text_psm4, page_num))
     candidates.append(parse_merged_page(text_psm4, page_num))
 
-    # Strategy 3: --psm 6 (uniform block, sometimes better for block layouts)
     text_psm6 = pytesseract.image_to_string(img, config='--psm 6')
     if is_block_format(text_psm6):
         candidates.append(parse_block_page(text_psm6, page_num))
     candidates.append(parse_merged_page(text_psm6, page_num))
 
-    # Pick the best candidate: most transactions wins; tie-break on balance chain validity
     best = []
     best_score = (-1, -1)
     for c in candidates:
@@ -480,7 +416,8 @@ def parse_account_info(img):
 
 
 def build_excel(transactions, account_name):
-    """Build formatted Excel workbook with debits, credits, and running balances."""
+    """Build formatted Excel workbook with debits, credits, running balances,
+    PDF balances, and a comparison status column."""
     wb = Workbook()
     ws = wb.active
     ws.title = "Bank Register"
@@ -492,7 +429,8 @@ def build_excel(transactions, account_name):
     money_fmt = '#,##0.00'
     thin_border = Border(bottom=Side(style='thin', color='D9D9D9'))
 
-    headers = ['Date', 'Page', 'Description', 'Debits (Out)', 'Credits (In)', 'Balance', 'Status']
+    headers = ['Date', 'Page', 'Description', 'Debits (Out)', 'Credits (In)',
+               'Balance', 'PDF Balance', 'Status']
     for col, h in enumerate(headers, 1):
         cell = ws.cell(row=1, column=col, value=h)
         cell.font = header_font
@@ -528,13 +466,31 @@ def build_excel(transactions, account_name):
             ws.cell(row=row, column=5, value=txn['amount']).number_format = money_fmt
             ws.cell(row=row, column=5).font = data_font
 
+        # Column F: Computed running balance (formula)
         prev = 'F2' if row == 3 else f'F{row-1}'
         ws.cell(row=row, column=6).value = f'={prev}-D{row}+E{row}'
         ws.cell(row=row, column=6).number_format = money_fmt
         ws.cell(row=row, column=6).font = data_font
 
-        ws.cell(row=row, column=7, value='').font = data_font
-        for c in range(1, 8):
+        # Column G: PDF Balance (from OCR)
+        pdf_bal = txn.get('balance')
+        if pdf_bal is not None:
+            ws.cell(row=row, column=7, value=pdf_bal).number_format = money_fmt
+            ws.cell(row=row, column=7).font = data_font
+        else:
+            ws.cell(row=row, column=7, value='N/A').font = data_font
+
+        # Column H: Status — compare computed balance (F) vs PDF balance (G)
+        if pdf_bal is not None:
+            ws.cell(row=row, column=8).value = (
+                f'=IF(ABS(F{row}-G{row})<0.02,"Match","MISMATCH $"'
+                f'&TEXT(F{row}-G{row},"+#,##0.00;-#,##0.00"))'
+            )
+            ws.cell(row=row, column=8).font = data_font
+        else:
+            ws.cell(row=row, column=8, value='No PDF bal').font = data_font
+
+        for c in range(1, 9):
             ws.cell(row=row, column=c).border = thin_border
 
     last_data = row
@@ -543,7 +499,7 @@ def build_excel(transactions, account_name):
     row += 1
     ws.cell(row=row, column=1, value='TOTALS').font = bold_font
     fill = PatternFill('solid', fgColor='D9E2F3')
-    for c in range(1, 8):
+    for c in range(1, 9):
         ws.cell(row=row, column=c).fill = fill
     ws.cell(row=row, column=4).value = f'=SUM(D3:D{last_data})'
     ws.cell(row=row, column=4).number_format = money_fmt
@@ -554,28 +510,60 @@ def build_excel(transactions, account_name):
     ws.cell(row=row, column=6).value = f'=F{last_data}'
     ws.cell(row=row, column=6).number_format = money_fmt
     ws.cell(row=row, column=6).font = bold_font
+    # Count mismatches vs matches
+    ws.cell(row=row, column=8).value = (
+        f'=COUNTIF(H3:H{last_data},"MISMATCH*")'
+        f'&" mismatches / "'
+        f'&COUNTIF(H3:H{last_data},"Match")&" matches"'
+    )
+    ws.cell(row=row, column=8).font = bold_font
 
-    # Summary
+    # Summary section
     row += 2
     ws.cell(row=row, column=1, value='Total items:').font = bold_font
     ws.cell(row=row, column=4, value=len(transactions)).font = bold_font
+
     row += 1
     ws.cell(row=row, column=1, value='Beginning balance:').font = bold_font
     ws.cell(row=row, column=6, value=beginning_balance).font = bold_font
     ws.cell(row=row, column=6).number_format = money_fmt
+
     row += 1
-    ws.cell(row=row, column=1, value='Ending balance:').font = bold_font
+    ws.cell(row=row, column=1, value='Ending balance (Excel):').font = bold_font
     ws.cell(row=row, column=6).value = f'=F{last_data}'
     ws.cell(row=row, column=6).font = bold_font
     ws.cell(row=row, column=6).number_format = money_fmt
+
+    row += 1
+    ws.cell(row=row, column=1, value='Ending balance (PDF):').font = bold_font
+    ws.cell(row=row, column=7).value = f'=G{last_data}'
+    ws.cell(row=row, column=7).font = bold_font
+    ws.cell(row=row, column=7).number_format = money_fmt
+
+    # Difference row
+    row += 1
+    diff_row = row
+    ws.cell(row=row, column=1, value='Difference (Excel - PDF):').font = bold_font
+    ws.cell(row=row, column=6).value = f'=F{last_data}-G{last_data}'
+    ws.cell(row=row, column=6).font = bold_font
+    ws.cell(row=row, column=6).number_format = money_fmt
+
+    # Reconciliation status
+    row += 1
+    ws.cell(row=row, column=1, value='Reconciliation:').font = bold_font
+    ws.cell(row=row, column=6).value = (
+        f'=IF(ABS(F{diff_row})<0.02,"BALANCED","OUT OF BALANCE")'
+    )
+    ws.cell(row=row, column=6).font = bold_font
 
     ws.column_dimensions['A'].width = 16
     ws.column_dimensions['B'].width = 8
     ws.column_dimensions['C'].width = 55
     ws.column_dimensions['D'].width = 16
     ws.column_dimensions['E'].width = 16
-    ws.column_dimensions['F'].width = 16
-    ws.column_dimensions['G'].width = 22
+    ws.column_dimensions['F'].width = 18
+    ws.column_dimensions['G'].width = 18
+    ws.column_dimensions['H'].width = 24
     ws.freeze_panes = 'A2'
 
     return wb
@@ -601,6 +589,13 @@ if uploaded_file:
         st.success(f"Found {len(all_transactions)} transactions from '{account_name}'")
 
         if all_transactions:
+            # Show balance comparison stats
+            with_bal = [t for t in all_transactions if t.get('balance') is not None]
+            without_bal = len(all_transactions) - len(with_bal)
+            st.write(f"**PDF balances found:** {len(with_bal)} of {len(all_transactions)} transactions")
+            if without_bal > 0:
+                st.warning(f"{without_bal} transactions have no PDF balance for comparison.")
+
             preview = []
             for t in all_transactions[:10]:
                 preview.append({
@@ -609,7 +604,7 @@ if uploaded_file:
                     'Description': t['description'][:60],
                     'Debit': f"${abs(t['amount']):,.2f}" if t['amount'] < 0 else '',
                     'Credit': f"${t['amount']:,.2f}" if t['amount'] >= 0 else '',
-                    'Balance': f"${t['balance']:,.2f}" if t['balance'] else '',
+                    'PDF Balance': f"${t['balance']:,.2f}" if t['balance'] else 'N/A',
                 })
             st.write("**Preview (first 10 transactions, newest first):**")
             st.table(preview)
