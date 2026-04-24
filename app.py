@@ -3,9 +3,10 @@ import re
 import io
 from pdf2image import convert_from_path
 import pytesseract
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.workbook.properties import CalcProperties
+from datetime import datetime
 import tempfile
 import os
 
@@ -675,6 +676,125 @@ def parse_account_info(img):
     return match.group(1).strip() if match else "Bank Register"
 
 
+# ---------------------------------------------------------------------------
+# Read existing Excel register and deduplication
+# ---------------------------------------------------------------------------
+
+def read_existing_excel(uploaded_excel):
+    """Read an existing Bank Register Excel file and extract transactions + metadata."""
+    wb = load_workbook(uploaded_excel, data_only=True)
+    ws = wb.active
+
+    # Read beginning balance from row 2, column F (6)
+    beginning_balance = ws.cell(row=2, column=6).value or 0
+
+    # Read account name from sheet title or fallback
+    account_name = ws.title if ws.title != "Bank Register" else "Bank Register"
+    # Try to extract from the file content - check if header exists
+    header_val = ws.cell(row=1, column=1).value
+    if header_val:
+        account_name = "Bank Register"
+
+    transactions = []
+    row = 3  # Data starts at row 3 (row 1 = headers, row 2 = beginning balance)
+    while row <= ws.max_row:
+        date_val = ws.cell(row=row, column=1).value
+        if date_val is None or date_val == 'TOTALS' or date_val == 'Total items:':
+            break
+        # Skip non-transaction rows
+        if isinstance(date_val, str) and date_val in ('Beginning Balance', 'TOTALS',
+                                                        'Total items:', 'Beginning balance:',
+                                                        'Ending balance (Excel):',
+                                                        'Ending balance (PDF):',
+                                                        'Difference (Excel - PDF):',
+                                                        'Reconciliation:'):
+            break
+
+        page_val = ws.cell(row=row, column=2).value
+        desc_val = ws.cell(row=row, column=3).value or ''
+        debit_val = ws.cell(row=row, column=4).value
+        credit_val = ws.cell(row=row, column=5).value
+        balance_val = ws.cell(row=row, column=6).value
+        pdf_bal_val = ws.cell(row=row, column=7).value
+
+        # Reconstruct amount: debits are negative, credits are positive
+        if debit_val is not None and debit_val != '' and debit_val != 0:
+            amount = -abs(float(debit_val))
+        elif credit_val is not None and credit_val != '' and credit_val != 0:
+            amount = abs(float(credit_val))
+        else:
+            row += 1
+            continue
+
+        # Handle date - could be string "M/D/YYYY" or datetime object
+        if isinstance(date_val, datetime):
+            date_str = f"{date_val.month}/{date_val.day}/{date_val.year}"
+        else:
+            date_str = str(date_val)
+
+        # Handle PDF balance - could be number or 'N/A'
+        pdf_balance = None
+        if pdf_bal_val is not None and pdf_bal_val != 'N/A':
+            try:
+                pdf_balance = float(pdf_bal_val)
+            except (ValueError, TypeError):
+                pdf_balance = None
+
+        transactions.append({
+            'date': date_str,
+            'page': page_val if page_val else 0,
+            'description': desc_val,
+            'amount': amount,
+            'balance': pdf_balance,
+        })
+        row += 1
+
+    wb.close()
+    return transactions, beginning_balance
+
+
+def _txn_key(txn):
+    """Create a deduplication key from a transaction's date, description, and amount."""
+    # Normalize: strip whitespace, lowercase description, round amount
+    desc = txn['description'].strip().lower()
+    # Remove extra spaces
+    desc = re.sub(r'\s+', ' ', desc)
+    amt = round(txn['amount'], 2)
+    return (txn['date'], desc, amt)
+
+
+def deduplicate_transactions(existing_txns, new_txns):
+    """Return only transactions from new_txns that don't already exist in existing_txns.
+
+    Uses a multiset approach so that if the same transaction appears twice in the PDF
+    and once in Excel, one copy is still added.
+    """
+    # Build a count of existing keys
+    existing_counts = {}
+    for txn in existing_txns:
+        key = _txn_key(txn)
+        existing_counts[key] = existing_counts.get(key, 0) + 1
+
+    unique_new = []
+    for txn in new_txns:
+        key = _txn_key(txn)
+        if existing_counts.get(key, 0) > 0:
+            existing_counts[key] -= 1  # "consume" one match
+        else:
+            unique_new.append(txn)
+
+    return unique_new
+
+
+def parse_date_for_sort(date_str):
+    """Parse 'M/D/YYYY' into a sortable datetime."""
+    try:
+        parts = date_str.split('/')
+        return datetime(int(parts[2]), int(parts[0]), int(parts[1]))
+    except (ValueError, IndexError):
+        return datetime(2000, 1, 1)
+
+
 def build_excel(transactions, account_name):
     """Build formatted Excel workbook with debits, credits, running balances,
     PDF balances, and a comparison status column."""
@@ -833,54 +953,151 @@ def build_excel(transactions, account_name):
 
 
 # --- Streamlit UI ---
-uploaded_file = st.file_uploader("Upload Bank Register PDF", type="pdf")
+mode = st.radio("Choose mode:", ["New Register", "Update Existing Register"], horizontal=True)
 
-if uploaded_file:
-    if st.button("Convert to Excel"):
-        with st.spinner("Running OCR on PDF pages... This may take a minute."):
-            images = ocr_pdf_to_images(uploaded_file)
-        st.info(f"Processed {len(images)} pages via OCR.")
+if mode == "New Register":
+    st.subheader("Create a New Register from PDF")
+    uploaded_file = st.file_uploader("Upload Bank Register PDF", type="pdf", key="new_pdf")
 
-        with st.spinner("Parsing transactions..."):
-            account_name = parse_account_info(images[0])
-            all_transactions = []
+    if uploaded_file:
+        if st.button("Convert to Excel"):
+            with st.spinner("Running OCR on PDF pages... This may take a minute."):
+                images = ocr_pdf_to_images(uploaded_file)
+            st.info(f"Processed {len(images)} pages via OCR.")
 
-            for page_num, img in enumerate(images, 1):
-                txns = parse_page(img, page_num, len(images))
-                all_transactions.extend(txns)
+            with st.spinner("Parsing transactions..."):
+                account_name = parse_account_info(images[0])
+                all_transactions = []
 
-        st.success(f"Found {len(all_transactions)} transactions from '{account_name}'")
+                for page_num, img in enumerate(images, 1):
+                    txns = parse_page(img, page_num, len(images))
+                    all_transactions.extend(txns)
 
-        if all_transactions:
-            # Show balance comparison stats
-            with_bal = [t for t in all_transactions if t.get('balance') is not None]
-            without_bal = len(all_transactions) - len(with_bal)
-            st.write(f"**PDF balances found:** {len(with_bal)} of {len(all_transactions)} transactions")
-            if without_bal > 0:
-                st.warning(f"{without_bal} transactions have no PDF balance for comparison.")
+            st.success(f"Found {len(all_transactions)} transactions from '{account_name}'")
 
-            preview = []
-            for t in all_transactions[:10]:
-                preview.append({
-                    'Date': t['date'],
-                    'Page': t['page'],
-                    'Description': t['description'][:60],
-                    'Debit': f"${abs(t['amount']):,.2f}" if t['amount'] < 0 else '',
-                    'Credit': f"${t['amount']:,.2f}" if t['amount'] >= 0 else '',
-                    'PDF Balance': f"${t['balance']:,.2f}" if t['balance'] else 'N/A',
-                })
-            st.write("**Preview (first 10 transactions, newest first):**")
-            st.table(preview)
+            if all_transactions:
+                with_bal = [t for t in all_transactions if t.get('balance') is not None]
+                without_bal = len(all_transactions) - len(with_bal)
+                st.write(f"**PDF balances found:** {len(with_bal)} of {len(all_transactions)} transactions")
+                if without_bal > 0:
+                    st.warning(f"{without_bal} transactions have no PDF balance for comparison.")
 
-        with st.spinner("Building Excel file..."):
-            wb = build_excel(all_transactions, account_name)
-            output = io.BytesIO()
-            wb.save(output)
-            output.seek(0)
+                preview = []
+                for t in all_transactions[:10]:
+                    preview.append({
+                        'Date': t['date'],
+                        'Page': t['page'],
+                        'Description': t['description'][:60],
+                        'Debit': f"${abs(t['amount']):,.2f}" if t['amount'] < 0 else '',
+                        'Credit': f"${t['amount']:,.2f}" if t['amount'] >= 0 else '',
+                        'PDF Balance': f"${t['balance']:,.2f}" if t['balance'] else 'N/A',
+                    })
+                st.write("**Preview (first 10 transactions, newest first):**")
+                st.table(preview)
 
-        st.download_button(
-            label="Download Excel File",
-            data=output.getvalue(),
-            file_name=f"Bank_Register_{account_name.replace(' ', '_')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.officedocument",
-        )
+            with st.spinner("Building Excel file..."):
+                wb = build_excel(all_transactions, account_name)
+                output = io.BytesIO()
+                wb.save(output)
+                output.seek(0)
+
+            st.download_button(
+                label="Download Excel File",
+                data=output.getvalue(),
+                file_name=f"Bank_Register_{account_name.replace(' ', '_')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.officedocument",
+            )
+
+else:
+    st.subheader("Update an Existing Register with New PDF Data")
+    st.write("Upload your existing Excel register and a new PDF. Only new transactions will be appended.")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        existing_excel = st.file_uploader("Upload Existing Excel Register", type=["xlsx"], key="existing_xlsx")
+    with col2:
+        new_pdf = st.file_uploader("Upload New PDF Register", type="pdf", key="update_pdf")
+
+    if existing_excel and new_pdf:
+        if st.button("Update Register"):
+            # Step 1: Read existing Excel
+            with st.spinner("Reading existing Excel register..."):
+                existing_txns, existing_beginning_bal = read_existing_excel(existing_excel)
+            st.info(f"Found {len(existing_txns)} existing transactions in the Excel file.")
+
+            # Step 2: OCR the new PDF
+            with st.spinner("Running OCR on new PDF pages... This may take a minute."):
+                images = ocr_pdf_to_images(new_pdf)
+            st.info(f"Processed {len(images)} pages via OCR.")
+
+            # Step 3: Parse new transactions
+            with st.spinner("Parsing new transactions..."):
+                account_name = parse_account_info(images[0])
+                new_transactions = []
+                for page_num, img in enumerate(images, 1):
+                    txns = parse_page(img, page_num, len(images))
+                    new_transactions.extend(txns)
+
+            st.info(f"Found {len(new_transactions)} transactions in the new PDF.")
+
+            # Step 4: Deduplicate
+            with st.spinner("Identifying new transactions..."):
+                # New PDF transactions come in reverse chronological order (newest first)
+                # Reverse them to chronological before deduplication
+                new_transactions.reverse()
+                unique_new = deduplicate_transactions(existing_txns, new_transactions)
+
+            if not unique_new:
+                st.warning("No new transactions found. The existing register is already up to date.")
+            else:
+                st.success(f"Found **{len(unique_new)}** new transactions to add.")
+
+                # Preview new transactions
+                preview = []
+                for t in unique_new[:10]:
+                    preview.append({
+                        'Date': t['date'],
+                        'Page': t['page'],
+                        'Description': t['description'][:60],
+                        'Debit': f"${abs(t['amount']):,.2f}" if t['amount'] < 0 else '',
+                        'Credit': f"${t['amount']:,.2f}" if t['amount'] >= 0 else '',
+                        'PDF Balance': f"${t['balance']:,.2f}" if t['balance'] else 'N/A',
+                    })
+                st.write(f"**New transactions to append (showing up to 10 of {len(unique_new)}):**")
+                st.table(preview)
+
+                # Step 5: Merge and rebuild
+                with st.spinner("Building updated Excel file..."):
+                    # Combine existing + new, then sort chronologically
+                    all_merged = existing_txns + unique_new
+                    all_merged.sort(key=lambda t: parse_date_for_sort(t['date']))
+
+                    # Rebuild the Excel from scratch with all transactions
+                    # We need to reverse because build_excel expects newest-first
+                    # and will reverse internally to chronological
+                    all_merged.reverse()
+                    wb = build_excel(all_merged, account_name)
+                    output = io.BytesIO()
+                    wb.save(output)
+                    output.seek(0)
+
+                # Generate filename based on the uploaded Excel name
+                original_name = existing_excel.name
+                base_name = original_name.rsplit('.', 1)[0]
+                # Increment version number if present (e.g., "04" -> "05")
+                ver_match = re.search(r'(\d+)$', base_name)
+                if ver_match:
+                    old_ver = int(ver_match.group(1))
+                    new_ver = str(old_ver + 1).zfill(len(ver_match.group(1)))
+                    new_name = base_name[:ver_match.start()] + new_ver + '.xlsx'
+                else:
+                    new_name = base_name + '_updated.xlsx'
+
+                st.download_button(
+                    label="Download Updated Excel File",
+                    data=output.getvalue(),
+                    file_name=new_name,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.officedocument",
+                )
+
+                st.write(f"**Summary:** {len(existing_txns)} existing + {len(unique_new)} new = {len(existing_txns) + len(unique_new)} total transactions")
