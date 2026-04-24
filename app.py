@@ -74,13 +74,15 @@ def is_header_or_footer(line):
     """Check if a line is a header, footer, or other non-transaction content."""
     skip_patterns = [
         r'^A(?:tlantic)?$', r'^4?\s*Union Bank', r'^Good Morning',
-        r'^Old Checking', r'^Operations\s+Checking', r'^Last Updated',
-        r'^Current Balance', r'^Available Balance',
-        r'^Transactions\s+Details',
+        r'^Good Afternoon', r'^Good Evening',
+        r'^Old Checking', r'^Operations\s+Checking', r'^Operations$',
+        r'^Last Updated', r'^Last$', r'^Updated:?$',
+        r'^Current Balance', r'^Current$', r'^Available Balance', r'^Available$',
+        r'^Transactions\s+Details', r'^Transactions$',
         r'^\$[\d,]+\.\d{2}\s+\$[\d,]+\.\d{2}$',
         r'^Date\s+Description', r'^Amount$', r'^Page totals:',
         r'^\d+\s*-\s*\d+\s+of\s+\d', r'^[<>]+$', r'^Pending\b',
-        r'^Details\s*&\s*Settings',
+        r'^Details\s*&\s*Settings', r'^Details$', r'^Settings$',
     ]
     return any(re.match(p, line, re.IGNORECASE) for p in skip_patterns)
 
@@ -113,12 +115,34 @@ def parse_page_positional_from_data(data, page_num):
             'h': data['height'][i], 'w': data['width'][i],
         })
 
+    # --- Identify "Pending" y-positions to exclude pending amounts ---
+    pending_y_positions = set()
+    for el in elements:
+        if el['text'].lower().startswith('pending'):
+            pending_y_positions.add(el['y'])
+            # Also mark nearby y positions (within 30 pixels)
+            for el2 in elements:
+                if abs(el2['y'] - el['y']) < 30:
+                    pending_y_positions.add(el2['y'])
+
+    # --- Find the y-position of the first month name to separate header from transactions ---
+    first_month_y = None
+    for el in elements:
+        if el['text'].upper() in MONTH_MAP:
+            first_month_y = el['y']
+            break
+
     # --- Identify transaction amounts (large font) and running balances (small font) ---
     amt_pattern = re.compile(r'^\(?\$[\d,]+\.\d{2}\)?$')
     txn_amts = []  # large-font dollar amounts
     bal_amts = []  # small-font dollar amounts
     for el in elements:
         if amt_pattern.match(el['text']):
+            # Skip amounts in the header area (above the first date) or near "Pending" lines
+            if first_month_y is not None and el['y'] < first_month_y - 100:
+                continue
+            if el['y'] in pending_y_positions:
+                continue
             if el['h'] >= MIN_TXN_HEIGHT:
                 txn_amts.append(el)
             else:
@@ -132,9 +156,15 @@ def parse_page_positional_from_data(data, page_num):
 
     # --- Define vertical bands: one per transaction ---
     # Band i runs from midpoint(i-1,i) to midpoint(i,i+1)
+    # Cap the first band so it doesn't extend to the top of the page
+    # (avoids pulling in header text on page 1)
+    MAX_BAND_ABOVE = 150  # max pixels above the amount to look for description
     bands = []
     for i, ta in enumerate(txn_amts):
-        y_start = 0 if i == 0 else (txn_amts[i - 1]['y'] + ta['y']) // 2
+        if i == 0:
+            y_start = max(0, ta['y'] - MAX_BAND_ABOVE)
+        else:
+            y_start = (txn_amts[i - 1]['y'] + ta['y']) // 2
         y_end = (
             max(el['y'] for el in elements) + 100
             if i == len(txn_amts) - 1
@@ -210,6 +240,10 @@ def parse_page_positional_from_data(data, page_num):
         desc_parts.sort(key=lambda p: p[0])
         desc = ' '.join(t for _, t in desc_parts).strip()
         desc = re.sub(r'^[©@&=\-_°®\s]+', '', desc).strip()
+        # Remove common OCR garble prefixes (e.g. "5006.", "oe", "Ae", "oon")
+        desc = re.sub(r'^[0-9]{4,}\.\s*', '', desc).strip()
+        desc = re.sub(r'^(oe|Ae|oon|oO)\s+', '', desc).strip()
+        desc = re.sub(r'^,\s*', '', desc).strip()
         desc = desc.rstrip(':;., ')
 
         txn_amt = parse_amount(txn_el['text'])
@@ -225,6 +259,35 @@ def parse_page_positional_from_data(data, page_num):
                 'amount': txn_amt,
                 'balance': balance,
             })
+        elif txn_amt is not None and month is None and desc:
+            # No date in this band — will try to inherit from neighbors below
+            transactions.append({
+                'date': None,  # placeholder — filled in by date propagation
+                'page': page_num,
+                'description': desc,
+                'amount': txn_amt,
+                'balance': balance,
+            })
+
+    # --- Date propagation: fill in None dates from nearest dated transaction ---
+    # Forward pass: carry last known date downward (older → newer on page)
+    last_date = None
+    for txn in transactions:
+        if txn['date'] is not None:
+            last_date = txn['date']
+        elif last_date is not None:
+            txn['date'] = last_date
+
+    # Backward pass: fill any remaining None dates from below (for bands above the first dated one)
+    last_date = None
+    for txn in reversed(transactions):
+        if txn['date'] is not None:
+            last_date = txn['date']
+        elif last_date is not None:
+            txn['date'] = last_date
+
+    # Remove any transactions that still have no date (header/pending artifacts)
+    transactions = [t for t in transactions if t['date'] is not None]
 
     return transactions
 
@@ -656,13 +719,13 @@ def parse_page(img, page_num, total_pages):
     # Re-uses the ocr_data already obtained above — no extra OCR call.
     # Matches descriptions to amounts by spatial position, fixing cases
     # where the block parser misaligns them.
-    has_block = is_block_default or is_block_format(text_psm4) or is_block_format(text_psm6)
-    if has_block:
-        pos = parse_page_positional_from_data(ocr_data, page_num)
-        pos_score = (len(pos), validate_balance_chain(pos))
-        if pos_score >= best_score:
-            best = pos
-            best_score = pos_score
+    # Always run as a candidate — it handles first/last pages where one date
+    # covers multiple transactions (e.g. "APR 22" with 5 checks below it).
+    pos = parse_page_positional_from_data(ocr_data, page_num)
+    pos_score = (len(pos), validate_balance_chain(pos))
+    if pos_score >= best_score:
+        best = pos
+        best_score = pos_score
 
     return best
 
