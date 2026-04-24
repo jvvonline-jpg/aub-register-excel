@@ -240,10 +240,14 @@ def parse_page_positional_from_data(data, page_num):
         desc_parts.sort(key=lambda p: p[0])
         desc = ' '.join(t for _, t in desc_parts).strip()
         desc = re.sub(r'^[©@&=\-_°®\s]+', '', desc).strip()
-        # Remove common OCR garble prefixes (e.g. "5006.", "oe", "Ae", "oon")
+        # Remove common OCR garble prefixes before CHECK numbers
+        # OCR often prepends garbled text like "5006.", "oe", "Ae", "oon",
+        # "Seon", "Noon", "ohne", "otinn", "eS", "o" before CHECK descriptions
         desc = re.sub(r'^[0-9]{4,}\.\s*', '', desc).strip()
-        desc = re.sub(r'^(oe|Ae|oon|oO)\s+', '', desc).strip()
         desc = re.sub(r'^,\s*', '', desc).strip()
+        # Remove short garbled prefix before CHECK/DEPOSIT/known keywords
+        desc = re.sub(r'^[A-Za-z]{1,5}\s+(?=CHECK\b)', '', desc).strip()
+        desc = re.sub(r'^[A-Za-z]{1,5}\s+(?=DEPOSIT\b)', '', desc).strip()
         desc = desc.rstrip(':;., ')
 
         txn_amt = parse_amount(txn_el['text'])
@@ -570,6 +574,10 @@ def parse_merged_page(text, page_num):
             txn_amount_str = None
 
         desc_part = re.sub(r'^[_=°®\s]+', '', desc_part).strip()
+        # Remove short garbled OCR prefixes before CHECK/DEPOSIT
+        desc_part = re.sub(r'^[A-Za-z]{1,5}\s+(?=CHECK\b)', '', desc_part).strip()
+        desc_part = re.sub(r'^[A-Za-z]{1,5}\s+(?=DEPOSIT\b)', '', desc_part).strip()
+        desc_part = re.sub(r'^,\s*', '', desc_part).strip()
 
         if not desc_part and i + 1 < len(filtered):
             peek = filtered[i + 1]
@@ -817,20 +825,24 @@ def read_existing_excel(uploaded_excel):
 
 
 def _txn_key(txn):
-    """Create a deduplication key from a transaction's date, description, and amount."""
-    # Normalize: strip whitespace, lowercase description, round amount
-    desc = txn['description'].strip().lower()
-    # Remove extra spaces
-    desc = re.sub(r'\s+', ' ', desc)
+    """Create a deduplication key from a transaction's date and amount only.
+
+    Description is intentionally excluded because OCR produces different text
+    for the same transaction across different PDF scans (e.g. 'CHECK - 10544'
+    vs 'CHECK 10544', or garbled prefixes like 'eS CHECK 10508').
+    Date + amount is sufficient for deduplication since it's rare to have
+    two transactions with the exact same date AND exact same amount.
+    """
     amt = round(txn['amount'], 2)
-    return (txn['date'], desc, amt)
+    return (txn['date'], amt)
 
 
 def deduplicate_transactions(existing_txns, new_txns):
     """Return only transactions from new_txns that don't already exist in existing_txns.
 
     Uses a multiset approach so that if the same transaction appears twice in the PDF
-    and once in Excel, one copy is still added.
+    and once in Excel, one copy is still added (handles duplicate deposits, etc.).
+    Matches by date + amount only (ignores description due to OCR variability).
     """
     # Build a count of existing keys
     existing_counts = {}
